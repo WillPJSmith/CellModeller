@@ -9,6 +9,10 @@ from pyopencl.reduction import ReductionKernel
 import random
 import time
 
+# DEBUG
+# print arrays in full so we can see what's going on
+numpy.set_printoptions(threshold=numpy.inf)
+
 
 ct_map = {}
 
@@ -32,7 +36,11 @@ class CLBacterium:
                  jitter_z=True,
                  alternate_divisions=False,
                  printing=True,
-                 compNeighbours=False):
+                 compNeighbours=False,
+                 periodic=False,
+                 N_x=False, 
+                 N_y=False,
+                 ):
 
         # Should we compute neighbours? (bit slow)
         self.computeNeighbours = compNeighbours
@@ -82,6 +90,126 @@ class CLBacterium:
         self.printing = printing
         self.progress_initialised = False
         self.sub_tick_initialised = False
+        
+        # extra bits for periodic mode
+        self.periodic = periodic
+        if self.periodic:
+        	if N_x and N_y:
+				self.N_x = N_x
+				self.N_y = N_y
+				self.set_periodic_grid()
+				self.init_data_periodic() # needs n_sqs to be set first
+				self.set_periodic_grid_connectivity()
+				self.set_periodic_offsets()
+    		else:
+    			print "Error: please specify grid dimensions (N_x>0, N_y>0) for Biophys in model file."
+        		exit(0)
+
+    def set_periodic_grid(self):
+        """
+        Initiate a grid for domains with fixed dimensions. 
+        This is a faster alternative to calling update_grid() every substep. 
+        """
+        print "Setting up periodic domain now..."
+        
+        # Periodic grids are user-specified; don't need to compute a grid to enclose all cells
+        self.min_x_coord = 0.0
+        self.min_y_coord = 0.0
+        self.max_x_coord = self.N_x * self.grid_spacing
+        self.max_y_coord = self.N_y * self.grid_spacing
+		
+        self.grid_x_min = 0
+        self.grid_x_max = self.N_x
+            
+        self.grid_y_min = 0
+        self.grid_y_max = self.N_x
+
+        self.n_sqs = self.N_x * self.N_y
+        print "		##  working with a fixed %i-by-%i grid (%i squares)..." % (self.N_x, self.N_y, self.n_sqs)
+		
+		
+    def set_periodic_grid_connectivity(self):
+		"""
+		Define the perodic Moore neighbourhood of each grid square
+		"""
+		print "		##  defining grid connectivity..."
+		
+		# index the grid squares
+		m = self.N_x; n = self.N_y
+		M = numpy.arange(m*n).reshape((m, n))
+		
+		# create an expanded grid with periodic border
+		Mb = numpy.zeros((m+2,n+2), numpy.int32);
+		Mb[1:m+1,1:n+1] = M;
+		Mb[1:m+1,0] = M[:,n-1];
+		Mb[1:m+1,n+1] = M[:,0];
+		Mb[0,1:n+1] = M[m-1,:];
+		Mb[m+1,1:n+1] = M[0,:];
+		Mb[0,0] = M[m-1,n-1];
+		Mb[0,n+1] = M[m-1,0];
+		Mb[m+1,0] = M[0,n-1];
+		Mb[m+1,n+1] = M[0,0];
+		
+		print 'Mb is:', Mb
+
+		# produce an analagous grid containing offset vector indices
+		O = 4*numpy.ones((m,n), numpy.int32)
+
+		# add a periodic border to O
+		Ob = numpy.zeros((m+2,n+2), numpy.int32);
+		Ob[1:m+1,1:n+1] = O;
+		Ob[:,0] = 3;
+		Ob[:,n+1] = 5;
+		Ob[0,:] = 1;
+		Ob[m+1,:] = 7;
+		Ob[0,n+1] = 2;
+		Ob[m+1,0] = 6;
+		Ob[0,0] = 0;
+		Ob[m+1,n+1] = 8; 
+		
+		# for each square in the grid, extract an ordered list of neighbour squares and a list of the corresponding offsets
+		Ns = numpy.zeros((m*n,9), numpy.int32);
+		Os = numpy.zeros((m*n,9), numpy.int32);
+		c = 0;
+		for i in range(1,m+1):
+			for j in range(1,n+1):
+				Ns[c,:] = [Mb[i-1,j-1],Mb[i-1,j],Mb[i-1,j+1],\
+						   Mb[i,  j-1],Mb[i,  j],Mb[i,  j+1],\
+						   Mb[i+1,j-1],Mb[i+1,j],Mb[i+1,j+1]]
+				   
+				Os[c,:] = [Ob[i-1,j-1],Ob[i-1,j],Ob[i-1,j+1],\
+						   Ob[i,  j-1],Ob[i,  j],Ob[i,  j+1],\
+						   Ob[i+1,j-1],Ob[i+1,j],Ob[i+1,j+1]]
+				c+=1;
+
+		self.sq_neighbour_inds = Ns.flatten()
+		self.sq_neighbour_offset_inds = Os.flatten()
+		print 'neighbours:', self.sq_neighbour_inds
+		print 'offsets:', self.sq_neighbour_offset_inds
+		
+		
+		self.sq_neighbour_inds_dev.set(self.sq_neighbour_inds)
+		self.sq_neighbour_offset_inds_dev.set(self.sq_neighbour_offset_inds)
+		
+		
+    def set_periodic_offsets(self):
+		"""
+		Precompute cell offset vectors for a given cuboidal domain.
+		"""
+		print "		##  Setting up offsets..."
+		L_x = self.max_x_coord - self.min_x_coord
+		L_y = self.max_y_coord - self.min_y_coord
+		self.offset_vecs[0] = (-1.0*L_x, -1.0*L_y, 0.0, 0.0)
+		self.offset_vecs[1] = (0.0, -1.0*L_y, 0.0, 0.0)
+		self.offset_vecs[2] = (+1.0*L_x, -1.0*L_y, 0.0, 0.0)
+		self.offset_vecs[3] = (-1.0*L_x, 0.0, 0.0, 0.0)
+		self.offset_vecs[4] = (0.0, 0.0, 0.0, 0.0)
+		self.offset_vecs[5] = (+1.0*L_x, 0.0, 0.0, 0.0)
+		self.offset_vecs[6] = (-1.0*L_x, +1.0*L_y, 0.0, 0.0)
+		self.offset_vecs[7] = (0.0, +1.0*L_y, 0.0, 0.0)
+		self.offset_vecs[8] = (+1.0*L_x, +1.0*L_y, 0.0, 0.0)
+		self.offset_vecs_dev.set(self.offset_vecs)
+	
 
     # Biophysical Model interface
     def reset(self):
@@ -256,7 +384,6 @@ class CLBacterium:
         self.n_cell_tos = numpy.zeros(cell_geom, numpy.int32)
         self.n_cell_tos_dev = cl_array.zeros(self.queue, cell_geom, numpy.int32)
 
-
         # the constructed 'matrix'
         mat_geom = (self.max_cells*self.max_contacts,)
         self.ct_inds = numpy.zeros(mat_geom, numpy.int32)
@@ -269,7 +396,6 @@ class CLBacterium:
         self.to_ents = numpy.zeros(mat_geom, vec.float8)
         self.to_ents_dev = cl_array.zeros(self.queue, mat_geom, vec.float8)
         
-
         # vectors and intermediates
         self.deltap = numpy.zeros(cell_geom, vec.float8)
         self.deltap_dev = cl_array.zeros(self.queue, cell_geom, vec.float8)
@@ -284,6 +410,26 @@ class CLBacterium:
         self.Ap_dev = cl_array.zeros(self.queue, cell_geom, vec.float8)
         self.res_dev = cl_array.zeros(self.queue, cell_geom, vec.float8)
         self.rhs_dev = cl_array.zeros(self.queue, cell_geom, vec.float8)
+
+
+    def init_data_periodic(self):
+		"""
+		additional arrays for periodic simulations
+		"""
+		# Connectivity of periodic grid
+		self.sq_neighbour_inds = numpy.zeros((self.n_sqs*9,), numpy.int32)
+		self.sq_neighbour_inds_dev = cl_array.zeros(self.queue, (self.n_sqs*9,), numpy.int32)
+		self.sq_neighbour_offset_inds = numpy.zeros((self.n_sqs*9,), numpy.int32)
+		self.sq_neighbour_offset_inds_dev = cl_array.zeros(self.queue, (self.n_sqs*9,), numpy.int32)
+
+		# offset vectors for computing cell images
+		self.offset_vecs = numpy.zeros((9,), vec.float4)
+		self.offset_vecs_dev = cl_array.zeros(self.queue, (9,), vec.float4)
+		
+		# offset vector inds used for each contact pair
+		ct_geom = (self.max_cells, self.max_contacts)
+		self.ct_to_offset_inds = numpy.zeros(ct_geom, numpy.int32)
+		self.ct_to_offset_inds_dev = cl_array.zeros(self.queue, ct_geom, numpy.int32)
     
 
     def load_from_cellstates(self, cell_states):
@@ -542,7 +688,10 @@ class CLBacterium:
 
         # redefine gridding based on the range of cell positions
         self.cell_centers[0:self.n_cells] = self.cell_centers_dev[0:self.n_cells].get()
-        self.update_grid() # we assume local cell_centers is current
+        
+        # update grid only for non-periodic simulations
+        if not self.periodic:
+        	self.update_grid() # we assume local cell_centers is current
 
         # get each cell into the correct sq and retrieve from the device
         self.bin_cells()
@@ -570,6 +719,10 @@ class CLBacterium:
     def sub_tick(self, dt):
         old_n_cts = self.n_cts
         self.predict()
+        
+        # DEBUG
+        print 'sub_tick #: %i / frame #: %i / n_cells: %i' % (self.sub_tick_i, self.frame_no, self.n_cells)
+        
         # find all contacts
         self.find_contacts()
         # place 'backward' contacts in cells
@@ -589,6 +742,8 @@ class CLBacterium:
     def sub_tick_finalise(self):
         #print "Substeps = %d"%self.sub_tick_i
         self.integrate()
+        if self.periodic:
+        	self.update_images()
         self.calc_cell_geom()
         self.sub_tick_initialised=False
 
@@ -718,77 +873,121 @@ class CLBacterium:
 
 
     def find_contacts(self, predict=True):
-        """Call the find_contacts kernel.
+		"""Call the find_contacts kernel.
 
-        Assumes that cell_centers, cell_dirs, cell_lens, cell_rads,
-        cell_sqs, cell_dcenters, cell_dlens, cell_dangs,
-        sorted_ids, and sq_inds are current on the device.
+		Assumes that cell_centers, cell_dirs, cell_lens, cell_rads,
+		cell_sqs, cell_dcenters, cell_dlens, cell_dangs,
+		sorted_ids, and sq_inds are current on the device.
 
-        Calculates cell_n_cts, ct_frs, ct_tos, ct_dists, ct_pts,
-        ct_norms, ct_reldists, and n_cts.
-        """
-        if predict:
-            centers = self.pred_cell_centers_dev
-            dirs = self.pred_cell_dirs_dev
-            lens = self.pred_cell_lens_dev
-        else:
-            centers = self.cell_centers_dev
-            dirs = self.cell_dirs_dev
-            lens = self.cell_lens_dev
+		Calculates cell_n_cts, ct_frs, ct_tos, ct_dists, ct_pts,
+		ct_norms, ct_reldists, and n_cts.
+		"""
+		if predict:
+			centers = self.pred_cell_centers_dev
+			dirs = self.pred_cell_dirs_dev
+			lens = self.pred_cell_lens_dev
+		else:
+			centers = self.cell_centers_dev
+			dirs = self.cell_dirs_dev
+			lens = self.cell_lens_dev
 
-        self.program.find_plane_contacts(self.queue,
-                                         (self.n_cells,),
-                                         None,
-                                         numpy.int32(self.max_cells),
-                                         numpy.int32(self.max_contacts),
-                                         numpy.int32(self.n_planes),
-                                         self.plane_pts_dev.data,
-                                         self.plane_norms_dev.data,
-                                         self.plane_coeffs_dev.data,
-                                         centers.data,
-                                         dirs.data,
-                                         lens.data,
-                                         self.cell_rads_dev.data,
-                                         self.cell_n_cts_dev.data,
-                                         self.ct_frs_dev.data,
-                                         self.ct_tos_dev.data,
-                                         self.ct_dists_dev.data,
-                                         self.ct_pts_dev.data,
-                                         self.ct_norms_dev.data,
-                                         self.ct_reldists_dev.data,
-                                         self.ct_stiff_dev.data).wait()
+		self.program.find_plane_contacts(self.queue,
+										 (self.n_cells,),
+										 None,
+										 numpy.int32(self.max_cells),
+										 numpy.int32(self.max_contacts),
+										 numpy.int32(self.n_planes),
+										 self.plane_pts_dev.data,
+										 self.plane_norms_dev.data,
+										 self.plane_coeffs_dev.data,
+										 centers.data,
+										 dirs.data,
+										 lens.data,
+										 self.cell_rads_dev.data,
+										 self.cell_n_cts_dev.data,
+										 self.ct_frs_dev.data,
+										 self.ct_tos_dev.data,
+										 self.ct_dists_dev.data,
+										 self.ct_pts_dev.data,
+										 self.ct_norms_dev.data,
+										 self.ct_reldists_dev.data,
+										 self.ct_stiff_dev.data).wait()
 
-        self.program.find_contacts(self.queue,
-                                   (self.n_cells,),
-                                   None,
-                                   numpy.int32(self.max_cells),
-                                   numpy.int32(self.n_cells),
-                                   numpy.int32(self.grid_x_min),
-                                   numpy.int32(self.grid_x_max),
-                                   numpy.int32(self.grid_y_min),
-                                   numpy.int32(self.grid_y_max),
-                                   numpy.int32(self.n_sqs),
-                                   numpy.int32(self.max_contacts),
-                                   centers.data,
-                                   dirs.data,
-                                   lens.data,
-                                   self.cell_rads_dev.data,
-                                   self.cell_sqs_dev.data,
-                                   self.sorted_ids_dev.data,
-                                   self.sq_inds_dev.data,
-                                   self.cell_n_cts_dev.data,
-                                   self.ct_frs_dev.data,
-                                   self.ct_tos_dev.data,
-                                   self.ct_dists_dev.data,
-                                   self.ct_pts_dev.data,
-                                   self.ct_norms_dev.data,
-                                   self.ct_reldists_dev.data,
-                                   self.ct_stiff_dev.data,
-                                   self.ct_overlap_dev.data).wait()
+		if self.periodic:
+			self.program.find_contacts_periodic(self.queue,
+									   (self.n_cells,),
+									   None,
+									   numpy.int32(self.max_cells),
+									   numpy.int32(self.n_cells),
+									   numpy.int32(self.grid_x_min),
+									   numpy.int32(self.grid_x_max),
+									   numpy.int32(self.grid_y_min),
+									   numpy.int32(self.grid_y_max),
+									   numpy.int32(self.n_sqs),
+									   numpy.int32(self.max_contacts),
+									   centers.data,
+									   dirs.data,
+									   self.offset_vecs_dev.data,
+									   lens.data,
+									   self.cell_rads_dev.data,
+									   self.cell_sqs_dev.data,
+									   self.sorted_ids_dev.data,
+									   self.sq_inds_dev.data,
+									   self.sq_neighbour_inds_dev.data,
+									   self.sq_neighbour_offset_inds_dev.data,
+									   self.cell_n_cts_dev.data,
+									   self.ct_frs_dev.data,
+									   self.ct_tos_dev.data,
+									   self.ct_to_offset_inds_dev.data,
+									   self.ct_dists_dev.data,
+									   self.ct_pts_dev.data,
+									   self.ct_norms_dev.data,
+									   self.ct_reldists_dev.data,
+									   self.ct_stiff_dev.data,
+									   self.ct_overlap_dev.data).wait()			
+		else:
+			self.program.find_contacts(self.queue,
+									   (self.n_cells,),
+									   None,
+									   numpy.int32(self.max_cells),
+									   numpy.int32(self.n_cells),
+									   numpy.int32(self.grid_x_min),
+									   numpy.int32(self.grid_x_max),
+									   numpy.int32(self.grid_y_min),
+									   numpy.int32(self.grid_y_max),
+									   numpy.int32(self.n_sqs),
+									   numpy.int32(self.max_contacts),
+									   centers.data,
+									   dirs.data,
+									   lens.data,
+									   self.cell_rads_dev.data,
+									   self.cell_sqs_dev.data,
+									   self.sorted_ids_dev.data,
+									   self.sq_inds_dev.data,
+									   self.cell_n_cts_dev.data,
+									   self.ct_frs_dev.data,
+									   self.ct_tos_dev.data,
+									   self.ct_dists_dev.data,
+									   self.ct_pts_dev.data,
+									   self.ct_norms_dev.data,
+									   self.ct_reldists_dev.data,
+									   self.ct_stiff_dev.data,
+									   self.ct_overlap_dev.data).wait()
 
-        # set dtype to int32 so we don't overflow the int32 when summing
-        #self.n_cts = self.cell_n_cts_dev.get().sum(dtype=numpy.int32)
-        self.n_cts = cl_array.sum(self.cell_n_cts_dev[0:self.n_cells]).get()
+		# set dtype to int32 so we don't overflow the int32 when summing
+		#self.n_cts = self.cell_n_cts_dev.get().sum(dtype=numpy.int32)
+		self.n_cts = cl_array.sum(self.cell_n_cts_dev[0:self.n_cells]).get()
+		
+		# DEBUG
+		self.cell_n_cts = self.cell_n_cts_dev.get()
+		self.ct_tos = self.ct_tos_dev.get()		
+		self.ct_frs = self.ct_frs_dev.get()	
+		self.ct_to_offset_inds = self.ct_to_offset_inds_dev.get()
+		
+# 		print 'cell_n_cts:', self.cell_n_cts
+# 		print 'ct_tos:', self.ct_tos
+# 		print 'ct_frs:', self.ct_frs
+# 		print 'ct_to_offset_inds:', self.ct_to_offset_inds
 
 
     def collect_tos(self):
@@ -799,25 +998,47 @@ class CLBacterium:
 
         Calculates cell_tos and n_cell_tos.
         """
-        self.program.collect_tos(self.queue,
-                                 (self.n_cells,),
-                                 None,
-                                 numpy.int32(self.max_cells),
-                                 numpy.int32(self.n_cells),
-                                 numpy.int32(self.grid_x_min),
-                                 numpy.int32(self.grid_x_max),
-                                 numpy.int32(self.grid_y_min),
-                                 numpy.int32(self.grid_y_max),
-                                 numpy.int32(self.n_sqs),
-                                 numpy.int32(self.max_contacts),
-                                 self.cell_sqs_dev.data,
-                                 self.sorted_ids_dev.data,
-                                 self.sq_inds_dev.data,
-                                 self.cell_n_cts_dev.data,
-                                 self.ct_frs_dev.data,
-                                 self.ct_tos_dev.data,
-                                 self.cell_tos_dev.data,
-                                 self.n_cell_tos_dev.data).wait()
+        if self.periodic:
+			self.program.collect_tos_periodic(self.queue,
+									 (self.n_cells,),
+									 None,
+									 numpy.int32(self.max_cells),
+									 numpy.int32(self.n_cells),
+									 numpy.int32(self.grid_x_min),
+									 numpy.int32(self.grid_x_max),
+									 numpy.int32(self.grid_y_min),
+									 numpy.int32(self.grid_y_max),
+									 numpy.int32(self.n_sqs),
+									 numpy.int32(self.max_contacts),
+									 self.cell_sqs_dev.data,
+									 self.sorted_ids_dev.data,
+									 self.sq_inds_dev.data,
+									 self.cell_n_cts_dev.data,
+									 self.ct_frs_dev.data,
+									 self.ct_tos_dev.data,
+									 self.sq_neighbour_inds_dev.data,
+									 self.cell_tos_dev.data,
+									 self.n_cell_tos_dev.data).wait()
+        else:
+			self.program.collect_tos(self.queue,
+									 (self.n_cells,),
+									 None,
+									 numpy.int32(self.max_cells),
+									 numpy.int32(self.n_cells),
+									 numpy.int32(self.grid_x_min),
+									 numpy.int32(self.grid_x_max),
+									 numpy.int32(self.grid_y_min),
+									 numpy.int32(self.grid_y_max),
+									 numpy.int32(self.n_sqs),
+									 numpy.int32(self.max_contacts),
+									 self.cell_sqs_dev.data,
+									 self.sorted_ids_dev.data,
+									 self.sq_inds_dev.data,
+									 self.cell_n_cts_dev.data,
+									 self.ct_frs_dev.data,
+									 self.ct_tos_dev.data,
+									 self.cell_tos_dev.data,
+									 self.n_cell_tos_dev.data).wait()
 
 
     def build_matrix(self):
@@ -829,24 +1050,46 @@ class CLBacterium:
 
         Calculates fr_ents and to_ents.
         """
-        self.program.build_matrix(self.queue,
-                                  (self.n_cells, self.max_contacts),
-                                  None,
-                                  numpy.int32(self.max_contacts),
-                                  numpy.float32(self.muA),
-                                  numpy.float32(self.gamma),
-                                  self.pred_cell_centers_dev.data,
-                                  self.pred_cell_dirs_dev.data,
-                                  self.pred_cell_lens_dev.data,
-                                  self.cell_rads_dev.data,
-                                  self.cell_n_cts_dev.data,
-                                  self.ct_frs_dev.data,
-                                  self.ct_tos_dev.data,
-                                  self.ct_pts_dev.data,
-                                  self.ct_norms_dev.data,
-                                  self.fr_ents_dev.data,
-                                  self.to_ents_dev.data,
-                                  self.ct_stiff_dev.data).wait()
+        if self.periodic:
+			self.program.build_matrix_periodic(self.queue,
+									  (self.n_cells, self.max_contacts),
+									  None,
+									  numpy.int32(self.max_contacts),
+									  numpy.float32(self.muA),
+									  numpy.float32(self.gamma),
+									  self.pred_cell_centers_dev.data,
+									  self.pred_cell_dirs_dev.data,
+									  self.pred_cell_lens_dev.data,
+									  self.cell_rads_dev.data,
+									  self.cell_n_cts_dev.data,
+									  self.ct_frs_dev.data,
+									  self.ct_tos_dev.data,
+									  self.ct_to_offset_inds_dev.data,
+									  self.ct_pts_dev.data,
+									  self.ct_norms_dev.data,
+									  self.offset_vecs_dev.data,
+									  self.fr_ents_dev.data,
+									  self.to_ents_dev.data,
+									  self.ct_stiff_dev.data).wait()
+        else:
+			self.program.build_matrix(self.queue,
+									  (self.n_cells, self.max_contacts),
+									  None,
+									  numpy.int32(self.max_contacts),
+									  numpy.float32(self.muA),
+									  numpy.float32(self.gamma),
+									  self.pred_cell_centers_dev.data,
+									  self.pred_cell_dirs_dev.data,
+									  self.pred_cell_lens_dev.data,
+									  self.cell_rads_dev.data,
+									  self.cell_n_cts_dev.data,
+									  self.ct_frs_dev.data,
+									  self.ct_tos_dev.data,
+									  self.ct_pts_dev.data,
+									  self.ct_norms_dev.data,
+									  self.fr_ents_dev.data,
+									  self.to_ents_dev.data,
+									  self.ct_stiff_dev.data).wait()
     
 
     def calculate_Ax(self, Ax, x, dt):
@@ -1014,6 +1257,20 @@ class CLBacterium:
                                self.cell_dcenters_dev.data,
                                self.cell_dangs_dev.data,
                                self.cell_dlens_dev.data).wait()
+
+    def update_images(self):
+		"""
+		Check cell coordinates for cells that have move outside of the boundary.
+		Assumes that cell_centers are current on the device.
+		"""
+		self.program.update_images(self.queue,
+											 (self.n_cells,),
+											 None,
+											 self.cell_centers_dev.data,
+											 numpy.float32(self.min_x_coord),
+											 numpy.float32(self.max_x_coord),
+											 numpy.float32(self.min_y_coord),
+											 numpy.float32(self.max_y_coord)).wait()
 
     def add_impulse(self):
         self.program.add_impulse(self.queue, (self.n_cells,), None,
