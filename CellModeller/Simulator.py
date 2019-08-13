@@ -355,25 +355,28 @@ visualised.
     ## Proceed to the next simulation step
     # This method is where objects phys, reg, sig and integ are called
     def step(self):
-        self.reg.step(self.dt)
-        states = dict(self.cellStates)
-        for (cid,state) in states.items():
-            if state.divideFlag:
-                self.divide(state) #neighbours no longer current
+		self.reg.step(self.dt)
+		states = dict(self.cellStates)
+		for (cid,state) in states.items():
+			if state.divideFlag:
+				self.divide(state) #neighbours no longer current
 
-        self.phys.set_cells()
-        while not self.phys.step(self.dt): #neighbours are current here
-            pass
-        if self.sig:
-            self.sig.step(self.dt)
-        if self.integ:
-            self.integ.step(self.dt)
+		self.phys.set_cells()
+		# make sure any daughter cells deposited outside the cell domain are teleported back in
+		if self.phys.periodic:
+			self.phys.update_images()
+		while not self.phys.step(self.dt): #neighbours are current here
+			pass
+		if self.sig:
+			self.sig.step(self.dt)
+		if self.integ:
+			self.integ.step(self.dt)
 
-        if self.saveOutput and self.stepNum%self.pickleSteps==0:
-            self.writePickle()
+		if self.saveOutput and self.stepNum%self.pickleSteps==0:
+			self.writePickle()
 
-        self.stepNum += 1
-        return True
+		self.stepNum += 1
+		return True
 
 
     ## Import cells to the simulator from csv file. The file contains a list of 7-coordinates {pos,dir,len} (comma delimited) of each cell - also, there should be no cells around - ie run this from an empty model instead of addcell
